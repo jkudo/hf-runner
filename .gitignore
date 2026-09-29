@@ -1,0 +1,8 @@
+node_modules/
+out/
+dist/
+launcher/dist/
+*.log
+.DS_Store
+*.tsbuildinfo
+__pycache__/

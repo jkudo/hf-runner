@@ -1,0 +1,57 @@
+appId: com.hfrunner.app
+productName: HF Runner
+# Electron 本体は HF Runner App.exe。ユーザーがダブルクリックする HF Runner.exe は launcher/ のランチャー
+# (数十 KB)。本体は Smart App Control / SmartScreen の初回解析で起動まで数秒止まることがあるため、
+# 先にランチャーが起動画面を出してから本体を起動する
+executableName: HF Runner App
+# zip / NSIS を作る直前にランチャー以外を app/ へ移し、ルートに exe が 1 つだけ見えるようにする (Windows のみ)
+artifactBuildStarted: scripts/nest-app.js
+copyright: Copyright (c) 2026 HF Runner
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**
+  - package.json
+asar: true
+# Chromium の UI 翻訳 (locales/*.pak) は日本語と英語だけ残す。全 55 言語だと約 48MB
+electronLanguages: [ja, en-US]
+extraResources:
+  - from: resources/python
+    to: python
+    filter: ['**/*.py']
+  # タスクトレイのアイコン
+  - from: build/icon.png
+    to: icon.png
+# llama.cpp のランタイムとモデルは userData 配下に実行時ダウンロードするためパッケージには含めない
+win:
+  icon: build/icon.png
+  # npm run build:launcher (dist:win に含まれる) で生成
+  extraFiles:
+    - from: launcher/dist/HF Runner.exe
+      to: HF Runner.exe
+    # このアプリのライセンス。同梱ソフトウェアのものは LICENSE.electron.txt / LICENSES.chromium.html と app.asar 内の各 LICENSE
+    - from: LICENSE
+      to: LICENSE.txt
+  target:
+    - target: nsis
+      arch: [x64]
+    # portable は起動のたびに一時フォルダへ全展開するため起動が遅い。インストール不要版は zip を使う
+    - target: zip
+      arch: [x64]
+  # GitHub のリリースはファイル名の空白を "." に置き換えるので、空白の無い名前にする
+  artifactName: HF-Runner-${version}-win-${arch}.${ext}
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  shortcutName: HF Runner
+  # インストーラーの言語は Windows の表示言語に合わせる (日本語以外は英語)
+  multiLanguageInstaller: true
+  installerLanguages: [ja_JP, en_US]
+  displayLanguageSelector: false
+linux:
+  icon: build/icon.png
+  category: Utility
+  target:
+    - AppImage
