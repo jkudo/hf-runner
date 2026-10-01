@@ -230,8 +230,15 @@ export function App() {
     }
   }, [])
 
+  const settingsSeq = useRef(0)
   const updateSettings = useCallback(async (patch: Partial<Settings>) => {
-    setSettings(await api.settings.set(patch))
+    // 画面の値は保存 (IPC の往復) を待たずにすぐ変える。入力欄は onChange の中で値が変わらないと React が元の値に書き戻すので、
+    // 待っていると日本語入力 (IME) の変換中に書き戻されて文字が重複する (システムプロンプト欄で「ああいあいう…」になっていた)
+    const seq = ++settingsSeq.current
+    setSettings((s) => (s ? { ...s, ...patch } : s))
+    const saved = await api.settings.set(patch)
+    // 保存結果 (メインで補正された値を含む) は最新の更新のときだけ反映する。続けて入力している間に古い結果で欄を書き戻さない
+    if (seq === settingsSeq.current) setSettings(saved)
     // 言語を変えたら、メインプロセスが作る表示 (バックエンドの説明など) を取り直す
     if (patch.language !== undefined) {
       const [b, sdb] = await Promise.all([api.runtime.backends(), api.sd.backends()])

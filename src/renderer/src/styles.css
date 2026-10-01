@@ -187,14 +187,19 @@ code.path { max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-s
 .chat-page { padding-bottom: 14px; }
 .chat-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 .chat-head-actions { display: flex; gap: 6px; }
-.params { display: grid; grid-template-columns: 1fr 200px 160px; gap: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
-.params label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.params { display: grid; grid-template-columns: 1fr 200px 260px 210px; gap: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
+.params label, .params-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+/* スライドバー + 手入力欄 (最大出力トークン) */
+.slider-with-input { display: flex; align-items: center; gap: 8px; }
+.slider-with-input input[type='range'] { flex: 1; min-width: 0; }
+.slider-with-input input[type='number'] { width: 92px; }
 .messages { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding: 4px 2px; }
 .msg { max-width: 82%; padding: 10px 14px; border-radius: 12px; line-height: 1.55; }
 .msg.user { align-self: flex-end; background: #2a3a55; border: 1px solid #35507a; }
 .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
 .msg-body .pre { white-space: pre-wrap; word-break: break-word; }
 .msg-stats { margin-top: 6px; }
+.msg-notice { margin-top: 8px; }
 .reasoning { margin-bottom: 8px; color: var(--muted); font-size: 12.5px; }
 .reasoning summary { cursor: pointer; display: flex; align-items: center; gap: 6px; }
 /* 思考中: 回転する半円 + 経過秒数、直近の 1 行を薄く表示 */

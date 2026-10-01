@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type DragEvent, type ClipboardEvent } from 'react'
 import { formatCount } from '@shared/format'
 import { L } from '@shared/i18n'
+import { limitNotice, THINKING_MODES, thinkingParams, type ThinkingMode } from '@shared/thinking'
+import { MAX_MAX_TOKENS, MAX_TOKEN_STOPS, MIN_MAX_TOKENS, nearestStopIndex, parseMaxTokens } from '@shared/tokens'
 import { useApp } from '../App'
 import { LoadProgressView } from '../components/LoadProgress'
 
@@ -17,6 +19,8 @@ interface Message {
   reasoningStartedAt?: number
   /** 思考にかかった時間。本文が始まった、または生成が終わった時点で確定 */
   reasoningMs?: number
+  /** 上限に達して止まったときの説明 (回答が出なかった・途中で終わった) */
+  notice?: string
 }
 
 interface StreamChunk {
@@ -122,6 +126,8 @@ export function ChatPage() {
     let tps: number | undefined
     let reasonStart: number | undefined
     let reasonEnd: number | undefined
+    let finish: string | null | undefined
+    const maxTokens = app.settings?.maxTokens ?? 2048
     const flush = (done = false) =>
       setMessages((prev) => {
         const next = [...prev]
@@ -137,8 +143,10 @@ export function ChatPage() {
         ],
         stream: true,
         temperature: app.settings?.temperature ?? 0.7,
-        max_tokens: app.settings?.maxTokens ?? 2048,
+        max_tokens: maxTokens,
         stream_options: { include_usage: true },
+        // 思考の量 (思考の上限トークン数・思考のオン/オフ)。標準では何も足さない
+        ...thinkingParams(app.settings?.thinkingMode),
       }
       const res = await fetch(`http://127.0.0.1:${s.port}/v1/chat/completions`, {
         method: 'POST',
@@ -183,6 +191,7 @@ export function ChatPage() {
               content += delta.content
               tokens++
             }
+            if (chunk.choices?.[0]?.finish_reason) finish = chunk.choices[0].finish_reason
             if (chunk.usage?.completion_tokens) tokens = chunk.usage.completion_tokens
             if (chunk.timings?.predicted_per_second) tps = chunk.timings.predicted_per_second
           }
@@ -196,10 +205,15 @@ export function ChatPage() {
       flush(true)
       const sec = (performance.now() - t0) / 1000
       const rate = tps ?? tokens / Math.max(sec, 0.001)
+      const notice = finish === 'length' ? limitNotice(!!content.trim(), !!reasoning, tokens >= maxTokens, maxTokens, s.contextSize) : undefined
       setMessages((prev) => {
         const next = [...prev]
         const last = next[next.length - 1]
-        next[next.length - 1] = { ...last, stats: L(`${tokens} トークン · ${rate.toFixed(1)} tok/s · ${sec.toFixed(1)} 秒`, `${tokens} tokens · ${rate.toFixed(1)} tok/s · ${sec.toFixed(1)}s`) }
+        next[next.length - 1] = {
+          ...last,
+          notice,
+          stats: L(`${tokens} トークン · ${rate.toFixed(1)} tok/s · ${sec.toFixed(1)} 秒`, `${tokens} tokens · ${rate.toFixed(1)} tok/s · ${sec.toFixed(1)}s`),
+        }
         return next
       })
     } catch (e) {
@@ -275,9 +289,16 @@ export function ChatPage() {
             {L('温度', 'Temperature')} {app.settings.temperature.toFixed(2)}
             <input type="range" min={0} max={2} step={0.05} value={app.settings.temperature} onChange={(e) => app.updateSettings({ temperature: Number(e.target.value) })} />
           </label>
-          <label>
-            {L('最大出力トークン', 'Max output tokens')}
-            <input type="number" min={16} max={65536} value={app.settings.maxTokens} onChange={(e) => app.updateSettings({ maxTokens: Number(e.target.value) || 2048 })} />
+          <MaxTokensField value={app.settings.maxTokens} contextSize={s.contextSize ?? app.settings.contextSize} onChange={(maxTokens) => app.updateSettings({ maxTokens })} />
+          <label title={L('Qwen3・DeepSeek-R1・gpt-oss など、回答の前に考えるモデルで効きます。短くするほど回答が早く出ますが、難しい質問の正確さは下がることがあります', 'Applies to models that think before answering (Qwen3, DeepSeek-R1, gpt-oss, …). Shorter thinking answers sooner but may be less accurate on hard questions')}>
+            {L('思考', 'Thinking')}
+            <select value={app.settings.thinkingMode ?? 'standard'} onChange={(e) => app.updateSettings({ thinkingMode: e.target.value as ThinkingMode })}>
+              {THINKING_MODES.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label()}
+                </option>
+              ))}
+            </select>
           </label>
         </div>
       )}
@@ -332,6 +353,7 @@ export function ChatPage() {
               </div>
             )}
             <MessageBody text={m.content} />
+            {m.notice && <div className="notice small warn msg-notice">⚠ {m.notice}</div>}
             {m.stats && <div className="msg-stats muted small">{m.stats}</div>}
           </div>
         ))}
@@ -408,6 +430,60 @@ export function ChatPage() {
           </button>
         )}
       </form>
+    </div>
+  )
+}
+
+/**
+ * 最大出力トークン。スライドバーはよく使う値 (MAX_TOKEN_STOPS) に吸い付き、それ以外は横の欄に手で入れる。
+ * 手入力は入力中に値を補正しない (「1」を打った時点で下限に直されると「1000」が打てない) よう、欄から離れたとき・Enter で反映する
+ */
+function MaxTokensField({ value, contextSize, onChange }: { value: number; contextSize?: number; onChange: (v: number) => void }) {
+  const [text, setText] = useState(String(value))
+  useEffect(() => setText(String(value)), [value])
+  const commit = () => {
+    const v = parseMaxTokens(text)
+    if (v === null) setText(String(value))
+    else if (v !== value) onChange(v)
+    else setText(String(value))
+  }
+  return (
+    <div className="params-field">
+      <span>
+        {L('最大出力トークン', 'Max output tokens')} {value.toLocaleString()}
+      </span>
+      <div className="slider-with-input">
+        <input
+          type="range"
+          min={0}
+          max={MAX_TOKEN_STOPS.length - 1}
+          step={1}
+          list="max-token-stops"
+          value={nearestStopIndex(value)}
+          onChange={(e) => onChange(MAX_TOKEN_STOPS[Number(e.target.value)])}
+          aria-label={L('最大出力トークン (よく使う値)', 'Max output tokens (common values)')}
+        />
+        <datalist id="max-token-stops">
+          {MAX_TOKEN_STOPS.map((_, i) => (
+            <option key={i} value={i} />
+          ))}
+        </datalist>
+        <input
+          type="number"
+          min={MIN_MAX_TOKENS}
+          max={MAX_MAX_TOKENS}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => e.key === 'Enter' && commit()}
+          aria-label={L('最大出力トークン (手入力)', 'Max output tokens (manual)')}
+        />
+      </div>
+      {contextSize !== undefined && value > contextSize && (
+        <span className="small">
+          {L(`コンテキスト長 (${contextSize.toLocaleString()}) を超える分は使われません`, `Anything beyond the context length (${contextSize.toLocaleString()}) is not used`)}
+        </span>
+      )}
     </div>
   )
 }

@@ -3,6 +3,7 @@
 import type { ComponentLicense, ComponentRole, DiffusionInfo } from './diffusion'
 import type { LanguageSetting } from './i18n'
 import type { TranslationModelId } from './translation'
+import type { ThinkingMode } from './thinking'
 
 export type Backend = 'cpu' | 'vulkan' | 'cuda12' | 'cuda13' | 'metal'
 /** gguf / safetensors = 言語モデル (llama.cpp / Transformers)、diffusion = 画像生成モデル (stable-diffusion.cpp。ファイル自体は .safetensors か .gguf) */
@@ -26,6 +27,8 @@ export interface Settings {
   systemPrompt: string
   temperature: number
   maxTokens: number
+  /** チャットの「思考」(思考するモデルが考える量) */
+  thinkingMode: ThinkingMode
   /** Python エンジンの PyTorch バックエンド */
   torchBackend: TorchBackend
   /** Transformers で読み込む既定の精度 */

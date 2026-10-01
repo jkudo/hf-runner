@@ -236,11 +236,11 @@ def normalize_messages(messages):
     return out
 
 
-def encode_text(tok, msgs):
-    """テキストのみ: チャットテンプレートでトークン化"""
+def encode_text(tok, msgs, tmpl):
+    """テキストのみ: チャットテンプレートでトークン化 (tmpl はテンプレートに渡す変数。enable_thinking など)"""
     plain = [{"role": m["role"], "content": m["content"]} for m in msgs]
     if getattr(tok, "chat_template", None):
-        out = tok.apply_chat_template(plain, add_generation_prompt=True, return_tensors="pt", return_dict=True)
+        out = tok.apply_chat_template(plain, add_generation_prompt=True, return_tensors="pt", return_dict=True, **tmpl)
         ids = out["input_ids"] if hasattr(out, "keys") else out
     else:
         text = "".join(f"{m['role'].capitalize()}: {m['content']}\n" for m in plain) + "Assistant:"
@@ -248,22 +248,28 @@ def encode_text(tok, msgs):
     return ids
 
 
-def build_text_inputs(msgs, max_new):
+def input_budget(max_new):
+    """入力 (会話の履歴) に使えるトークン数。出力の分を空けるが、最大出力トークンがとても大きくても (999999 など)
+    コンテキストの半分までしか空けない (以前は入力が 64 トークンまで削られ、システムプロンプトや履歴が消えていた)"""
+    return max(64, args.max_context - min(max_new, args.max_context // 2))
+
+
+def build_text_inputs(msgs, max_new, tmpl):
     """コンテキスト長に収まるよう、古いメッセージから落としてトークン化する"""
     tok = state["tok"]
-    budget = max(64, args.max_context - max_new)
+    budget = input_budget(max_new)
     msgs = list(msgs)
-    ids = encode_text(tok, msgs)
+    ids = encode_text(tok, msgs, tmpl)
     while ids.shape[1] > budget and len(msgs) > 1:
         idx = 1 if msgs[0]["role"] == "system" and len(msgs) > 1 else 0
         del msgs[idx]
-        ids = encode_text(tok, msgs)
+        ids = encode_text(tok, msgs, tmpl)
     if ids.shape[1] > budget:
         ids = ids[:, -budget:]
     return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
 
 
-def encode_with_processor(msgs):
+def encode_with_processor(msgs, tmpl):
     """視覚言語モデル: processor のチャットテンプレート (chat_template.json) で {type: image} の位置に画像を差し込み、画像とまとめて前処理する。
     テキストのみでもトークナイザではなく processor のテンプレートを使う (トークナイザ側にテンプレートが無いモデルがあるため)"""
     processor = state["processor"]
@@ -275,7 +281,7 @@ def encode_with_processor(msgs):
         if m["content"]:
             parts.append({"type": "text", "text": m["content"]})
         hf_msgs.append({"role": m["role"], "content": parts})
-    prompt = processor.apply_chat_template(hf_msgs, add_generation_prompt=True, tokenize=False)
+    prompt = processor.apply_chat_template(hf_msgs, add_generation_prompt=True, tokenize=False, **tmpl)
     if images:
         return dict(processor(text=[prompt], images=images, return_tensors="pt"))
     try:
@@ -284,16 +290,97 @@ def encode_with_processor(msgs):
         return dict(state["tok"](prompt, return_tensors="pt"))
 
 
-def build_vision_inputs(msgs, max_new):
+def build_vision_inputs(msgs, max_new, tmpl):
     """コンテキスト長に収まるよう、古いメッセージ (画像込み) から落とす"""
-    budget = max(64, args.max_context - max_new)
+    budget = input_budget(max_new)
     msgs = list(msgs)
-    inputs = encode_with_processor(msgs)
+    inputs = encode_with_processor(msgs, tmpl)
     while inputs["input_ids"].shape[1] > budget and len(msgs) > 1:
         idx = 1 if msgs[0]["role"] == "system" and len(msgs) > 1 else 0
         del msgs[idx]
-        inputs = encode_with_processor(msgs)
+        inputs = encode_with_processor(msgs, tmpl)
     return inputs
+
+
+def vocab_id(tok, token):
+    """語彙にあるトークンの ID (無ければ None)"""
+    tid = tok.get_vocab().get(token)
+    return int(tid) if tid is not None else None
+
+
+class ThinkBudget(StoppingCriteria):
+    """思考 (<think> … </think>) が上限のトークン数に達したら生成を止める。止めたら呼び出し側が </think> を足して回答を続けさせる
+    (llama.cpp の thinking_budget_tokens と同じ動き)"""
+
+    def __init__(self, prompt_len, budget, start_id, end_id, thinking_at_start):
+        self.prompt_len = prompt_len
+        self.budget = budget
+        self.start_id = start_id
+        self.end_id = end_id
+        self.thinking_at_start = thinking_at_start
+        self.hit = False
+
+    def __call__(self, input_ids, scores, **kwargs):
+        gen = input_ids[0, self.prompt_len :]
+        if (gen == self.end_id).any():
+            return False  # 思考は終わっている
+        if not (self.thinking_at_start or (self.start_id is not None and bool((gen == self.start_id).any()))):
+            return False  # 思考していない (そのまま回答している)
+        if gen.shape[0] > self.budget:
+            self.hit = True
+            return True
+        return False
+
+
+def prompt_ends_in_thinking(ids, start_id, end_id):
+    """プロンプトの末尾が思考の途中か (テンプレートが生成の頭に <think> を入れるモデル)"""
+    if start_id is None:
+        return False
+    tail = ids[0, -8:].tolist()
+    if start_id not in tail:
+        return False
+    last_start = len(tail) - 1 - tail[::-1].index(start_id)
+    return end_id not in tail[last_start:]
+
+
+def run_generate(inputs, max_new, extra_criteria, params, stop_event, on_piece):
+    """generate を別スレッドで回し、出力を on_piece に流す。生成した列 (プロンプト込み) と生成トークン数を返す"""
+    model, tok = state["model"], state["tok"]
+    streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+    crit = StopOnEvent(stop_event)
+    temp = params["temperature"]
+    gen_kwargs = dict(
+        **inputs,
+        streamer=streamer,
+        max_new_tokens=max_new,
+        stopping_criteria=StoppingCriteriaList([crit, *extra_criteria]),
+        pad_token_id=tok.pad_token_id,
+        do_sample=temp > 0,
+    )
+    if temp > 0:
+        gen_kwargs["temperature"] = temp
+        gen_kwargs["top_p"] = params["top_p"]
+    result = {}
+
+    def run():
+        try:
+            with torch.inference_mode():
+                result["seq"] = model.generate(**gen_kwargs)
+        except Exception as e:  # noqa: BLE001
+            result["error"] = e
+            traceback.print_exc()
+            streamer.end()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    for piece in streamer:
+        if piece:
+            on_piece(piece)
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    seq = result["seq"]
+    return seq, int(seq.shape[1] - inputs["input_ids"].shape[1])
 
 
 def generate(msgs, params, stop_event, on_piece):
@@ -301,44 +388,38 @@ def generate(msgs, params, stop_event, on_piece):
     has_images = any(m["images"] for m in msgs)
     if has_images and not state["vision"]:
         raise ValueError(L("このモデルは画像入力に対応していません", "This model does not support image input"))
-    inputs = build_vision_inputs(msgs, params["max_tokens"]) if state["vision"] else build_text_inputs(msgs, params["max_tokens"])
+    tmpl = params["template_kwargs"]
+    inputs = build_vision_inputs(msgs, params["max_tokens"], tmpl) if state["vision"] else build_text_inputs(msgs, params["max_tokens"], tmpl)
     inputs = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
-    streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
-    crit = StopOnEvent(stop_event)
-    temp = params["temperature"]
-    gen_kwargs = dict(
-        **inputs,
-        streamer=streamer,
-        max_new_tokens=params["max_tokens"],
-        stopping_criteria=StoppingCriteriaList([crit]),
-        pad_token_id=tok.pad_token_id,
-        do_sample=temp > 0,
-    )
-    if temp > 0:
-        gen_kwargs["temperature"] = temp
-        gen_kwargs["top_p"] = params["top_p"]
-    failure = {}
+    prompt_n = int(inputs["input_ids"].shape[1])
+    # 出力はコンテキストの残りまで (最大出力トークンがそれより大きければ、そこで止まる = "length")
+    limit = max(1, min(params["max_tokens"], args.max_context - prompt_n))
 
-    def run():
-        try:
-            with torch.inference_mode():
-                model.generate(**gen_kwargs)
-        except Exception as e:  # noqa: BLE001
-            failure["error"] = e
-            traceback.print_exc()
-            streamer.end()
+    # 思考の上限 (thinking_budget_tokens)。テキストのみのモデルで、<think> / </think> がトークンとしてあるときだけ
+    budget = params["thinking_budget"]
+    start_id, end_id = vocab_id(tok, "<think>"), vocab_id(tok, "</think>")
+    criteria = []
+    if budget is not None and budget >= 0 and end_id is not None and not state["vision"]:
+        think = ThinkBudget(prompt_n, budget, start_id, end_id, prompt_ends_in_thinking(inputs["input_ids"], start_id, end_id))
+        criteria.append(think)
+    else:
+        think = None
 
     t0 = time.time()
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    for piece in streamer:
-        if piece:
-            on_piece(piece)
-    thread.join()
-    if "error" in failure:
-        raise failure["error"]
+    seq, n = run_generate(inputs, limit, criteria, params, stop_event, on_piece)
+    if think is not None and think.hit and not stop_event.is_set():
+        # 思考を打ち切り、</think> を足して回答を続けさせる
+        close_text = "\n</think>\n\n"
+        on_piece(close_text)
+        close_ids = tok(close_text, add_special_tokens=False, return_tensors="pt")["input_ids"].to(seq.device)
+        ids = torch.cat([seq, close_ids], dim=1)
+        rest = limit - n - close_ids.shape[1]
+        n += close_ids.shape[1]
+        if rest > 0:
+            _, n2 = run_generate({"input_ids": ids, "attention_mask": torch.ones_like(ids)}, rest, [], params, stop_event, on_piece)
+            n += n2
     elapsed = time.time() - t0
-    return {"prompt_n": int(inputs["input_ids"].shape[1]), "predicted_n": crit.count, "elapsed": elapsed}
+    return {"prompt_n": prompt_n, "predicted_n": n, "elapsed": elapsed, "finish": "length" if n >= limit else "stop"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -414,10 +495,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": {"message": L(f"画像を読み取れません: {e}", f"Could not read the image: {e}")}})
         if not msgs:
             return self._json(400, {"error": {"message": "messages is empty"}})
+        # チャットテンプレートに渡す変数 (enable_thinking など)。OpenAI 形式の reasoning_effort もテンプレートの変数として渡す
+        tmpl = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+        if isinstance(req.get("reasoning_effort"), str) and "reasoning_effort" not in tmpl:
+            tmpl = {**tmpl, "reasoning_effort": req["reasoning_effort"]}
+        budget = req.get("thinking_budget_tokens")
         params = {
             "temperature": float(req.get("temperature", 0.7) or 0),
             "top_p": float(req.get("top_p", 0.95) or 0.95),
             "max_tokens": int(req.get("max_tokens") or req.get("max_completion_tokens") or 1024),
+            "template_kwargs": tmpl,
+            # 思考の上限トークン数 (llama.cpp と同じ名前)。-1 / 未指定は無制限
+            "thinking_budget": int(budget) if isinstance(budget, (int, float)) and budget >= 0 else None,
         }
         if not gen_lock.acquire(timeout=0.2):
             return self._json(429, {"error": {"message": L("別の生成が実行中です", "Another generation is in progress")}})
@@ -443,7 +532,7 @@ class Handler(BaseHTTPRequestHandler):
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": ALIAS,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop" if stats["predicted_n"] < params["max_tokens"] else "length"}],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": stats["finish"]}],
                 "usage": {"prompt_tokens": stats["prompt_n"], "completion_tokens": stats["predicted_n"], "total_tokens": stats["prompt_n"] + stats["predicted_n"]},
             },
         )
@@ -478,7 +567,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             stats = generate(msgs, params, stop_event, lambda piece: emit(splitter.feed(piece)))
             emit(splitter.flush())
-            send(chunk({}, "stop" if stats["predicted_n"] < params["max_tokens"] else "length"))
+            send(chunk({}, stats["finish"]))
             n, el = stats["predicted_n"], stats["elapsed"]
             send(
                 {

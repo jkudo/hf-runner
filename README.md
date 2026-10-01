@@ -87,7 +87,7 @@ Select a model to see each file with its size and a color showing whether it wil
 
 Click "▶ Launch" in the Library to load the model and switch to Chat. A progress bar shows the loading progress.
 
-- For models that output their reasoning (`<think>`), the reasoning is shown folded
+- For models that output their reasoning (`<think>`), the reasoning is shown folded. If a model thinks too long, set "Thinking" under "Parameters" to Short, Minimal or Off to get the answer sooner
 - With vision models you can attach images by pasting, dropping, or the attach button
 - When you're done, click "⏏ Unload" to free the memory
 - Each engine's launch command can be edited under "Launch command" in Settings (e.g. add `-ctk q8_0 -ctv q8_0` to llama.cpp, or change `-c {ctx}` to `-c 8192`). Placeholders such as `{model}` and `{port}` are replaced with the model path, port, etc. on each launch. "Restore default" reverts it at any time

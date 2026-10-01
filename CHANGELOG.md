@@ -5,6 +5,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-01
+
+### Added
+
+- "Thinking" option in the chat's Parameters (Standard / Short / Minimal / Off) for models that think before answering (Qwen3, DeepSeek-R1, gpt-oss, …). Short and Minimal cap the thinking at 1,024 / 256 tokens and then make the model answer; Off answers without thinking. Works with llama.cpp and the Python engine, and takes effect from the next message
+- "Max output tokens" in the chat's Parameters has a slider that snaps to common values (128 – 32,768) next to a box for any other value. A note appears when the value is larger than the context length
+
+### Fixed
+
+- Text typed with an IME (Japanese, Chinese, Korean, …) in the chat's system prompt was duplicated while converting ("ああいあいう…")
+- When thinking used up the max output tokens or the context length, the chat ended with an empty answer and no explanation. It now says which limit was reached and what to change
+- Python engine: with a very large max output tokens (e.g. 999999), the input was cut down to 64 tokens, dropping the system prompt and earlier messages. Output now stops at the end of the context instead
+
 ## [0.1.0] - 2026-09-30
 
 First public release. A Windows desktop app to find models on Hugging Face, download them and run them on your own PC.
@@ -42,5 +55,6 @@ First public release. A Windows desktop app to find models on Hugging Face, down
 - Installer (`.exe`) and a no-install zip version that keeps the app, engines and models in one folder
 - The app is not code-signed: Windows SmartScreen shows a warning on first run ("More info" → "Run anyway")
 
-[Unreleased]: ../../compare/v0.1.0...HEAD
+[Unreleased]: ../../compare/v0.1.1...HEAD
+[0.1.1]: ../../compare/v0.1.0...v0.1.1
 [0.1.0]: ../../releases/tag/v0.1.0

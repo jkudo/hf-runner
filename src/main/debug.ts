@@ -327,12 +327,24 @@ async function run(win: BrowserWindow, outDir: string): Promise<void> {
     await js(`(() => { const t = document.querySelector('.composer textarea'); t.focus(); document.execCommand('insertText', false, ${JSON.stringify(prompt)}); })()`)
     await sleep(300)
     await js(`document.querySelector('.composer button[type=submit]')?.click()`)
-    await sleep(vision ? 30000 : 15000)
+    // 回答が終わる (統計が出る) まで待つ。思考するモデルは長くかかるので最大 3 分
+    for (let w = 0; w < 360; w++) {
+      await sleep(500)
+      if (await js<boolean>(`!![...document.querySelectorAll('.msg.assistant')].pop()?.querySelector('.msg-stats')`)) break
+    }
     await shot(`06-chat-${i}-${m.format}`)
     const reply = await js<string>(`[...document.querySelectorAll('.msg.assistant .msg-body')].pop()?.textContent ?? ''`)
     const stats = await js<string>(`[...document.querySelectorAll('.msg.assistant .msg-stats')].pop()?.textContent ?? ''`)
+    // 思考の長さと、上限で止まったときの説明 (思考 = 設定の「思考」、上限 = 最大出力トークン / コンテキスト長)
+    const thought = await js<number>(`[...document.querySelectorAll('.msg.assistant')].pop()?.querySelector('.reasoning .pre')?.textContent?.length ?? 0`)
+    const notice = await js<string>(`[...document.querySelectorAll('.msg.assistant')].pop()?.querySelector('.msg-notice')?.textContent ?? ''`)
     console.log(`[e2e] reply (${m.format}):`, JSON.stringify(reply).slice(0, 300))
-    console.log(`[e2e] stats (${m.format}):`, stats)
+    console.log(`[e2e] stats (${m.format}):`, stats, `| thinking chars: ${thought}`, notice ? `| notice: ${notice}` : '')
+    // パラメータ (システムプロンプト・温度・最大出力トークン・思考) を開いて撮る
+    await js(`[...document.querySelectorAll('.chat-head-actions button')].find(b => b.textContent.includes('パラメータ'))?.click()`)
+    await sleep(300)
+    await shot(`06-chat-params-${i}`)
+    await js(`[...document.querySelectorAll('.chat-head-actions button')].find(b => b.textContent.includes('パラメータを隠す'))?.click()`)
     // HFRUNNER_E2E_LAN: サーバーモードを有効にし、LAN 側の IP アドレス経由 (他の PC と同じ経路) で API を呼ぶ
     if (process.env.HFRUNNER_E2E_LAN) {
       // 設定画面のチェックボックスを実際に押して有効にする
@@ -408,6 +420,55 @@ async function run(win: BrowserWindow, outDir: string): Promise<void> {
   await js(`[...document.querySelectorAll('.form-label')].find(e => e.textContent === '使用する GPU')?.closest('.form-row')?.scrollIntoView({ block: 'center' })`)
   await sleep(400)
   await shot('07-settings-gpu')
+
+  // 設定の入力欄 (システムプロンプト) に日本語入力 (IME) で打っても、変換中の文字が重複しないこと。
+  // Chrome DevTools Protocol の Input.imeSetComposition で変換中の文字を 1 文字ずつ増やし、最後に Input.insertText で確定する
+  await clickNav('チャット')
+  await sleep(500)
+  const originalPrompt = await js<string>(`window.api.settings.get().then(s => s.systemPrompt)`)
+  await js(`[...document.querySelectorAll('.chat-head-actions button')].find(b => b.textContent.includes('パラメータ'))?.click()`)
+  await sleep(300)
+  await js(`(() => { const t = document.querySelector('.params textarea'); t.focus(); t.select(); document.execCommand('delete') })()`)
+  await sleep(300)
+  const word = 'あいうえおかきくけこ'
+  wc.debugger.attach('1.3')
+  try {
+    for (let i = 1; i <= word.length; i++) {
+      await wc.debugger.sendCommand('Input.imeSetComposition', { text: word.slice(0, i), selectionStart: i, selectionEnd: i })
+      await sleep(40)
+    }
+    await wc.debugger.sendCommand('Input.insertText', { text: word })
+  } finally {
+    wc.debugger.detach()
+  }
+  await sleep(800)
+  const shownPrompt = await js<string>(`document.querySelector('.params textarea').value`)
+  const savedPrompt = await js<string>(`window.api.settings.get().then(s => s.systemPrompt)`)
+  console.log(`[e2e] IME input: shown=${JSON.stringify(shownPrompt)} saved=${JSON.stringify(savedPrompt)} ok=${shownPrompt === word && savedPrompt === word}`)
+  await shot('08-ime-system-prompt')
+  await js(`window.api.settings.set({ systemPrompt: ${JSON.stringify(originalPrompt)} })`)
+
+  // 最大出力トークン: スライドバーはよく使う値に吸い付き、横の欄は手入力 (入力中は補正せず、Enter / 欄から離れたときに反映)
+  const originalMax = await js<number>(`window.api.settings.get().then(s => s.maxTokens)`)
+  const savedMax = () => js<number>(`window.api.settings.get().then(s => s.maxTokens)`)
+  const field = `document.querySelector('.slider-with-input input[type=number]')`
+  // スライドバーを 7 番目の目盛り (8,192) へ。React の range は input イベントで値を受け取る
+  await js(
+    `(() => { const r = document.querySelector('.slider-with-input input[type=range]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(r, '6'); r.dispatchEvent(new Event('input', { bubbles: true })) })()`,
+  )
+  await sleep(400)
+  const bySlider = await savedMax()
+  // 手入力: 「1」を打った時点では補正されず、続けて「000」で 1000、Enter で保存
+  await js(`(() => { const t = ${field}; t.focus(); t.select(); document.execCommand('insertText', false, '1') })()`)
+  await sleep(300)
+  const whileTyping = await js<string>(`${field}.value`)
+  await js(`(() => { const t = ${field}; document.execCommand('insertText', false, '000'); t.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })()`)
+  await sleep(400)
+  const byTyping = await savedMax()
+  const label = await js<string>(`document.querySelector('.params-field > span')?.textContent ?? ''`)
+  console.log(`[e2e] max tokens: slider=${bySlider} while typing="${whileTyping}" typed=${byTyping} label="${label}" ok=${bySlider === 8192 && whileTyping === '1' && byTyping === 1000}`)
+  await shot('08-max-tokens')
+  await js(`window.api.settings.set({ maxTokens: ${originalMax} })`)
 
   console.log('[e2e] done')
 }
